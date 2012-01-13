@@ -1,0 +1,672 @@
+From: =?UTF-8?q?Carl=20F=C3=BCrstenberg?= <azatoth@gmail.com>
+Date: Tue, 16 Aug 2011 15:05:23 +0200
+Subject: Excito Bubba|2 config
+
+---
+ arch/powerpc/platforms/83xx/Kconfig     |    6 +
+ arch/powerpc/platforms/83xx/Makefile    |    1 +
+ arch/powerpc/platforms/83xx/bubbatwo.c  |  496 ++++++
+ arch/powerpc/platforms/83xx/mpc83xx.h   |   55 +
+ arch/powerpc/platforms/83xx/usb.c       |    2 +-
+ drivers/rtc/rtc-isl1208.c               |   15 +-
+ 7 files changed, 3498 insertions(+), 5 deletions(-)
+ create mode 100644 arch/powerpc/platforms/83xx/bubbatwo.c
+
+diff --git a/arch/powerpc/platforms/83xx/Kconfig b/arch/powerpc/platforms/83xx/Kconfig
+index 73f4135..65670be 100644
+--- a/arch/powerpc/platforms/83xx/Kconfig
++++ b/arch/powerpc/platforms/83xx/Kconfig
+@@ -24,6 +24,12 @@ config MPC831x_RDB
+ 	help
+ 	  This option enables support for the MPC8313 RDB and MPC8315 RDB boards.
+ 
++config BUBBATWO
++	tristate "Excito BUBBATWO"
++	depends on MPC831x_RDB
++	help
++	  This option enables BUBBATWO specific functionality to a MPC8313 board
++
+ config MPC832x_MDS
+ 	bool "Freescale MPC832x MDS"
+ 	select DEFAULT_UIMAGE
+diff --git a/arch/powerpc/platforms/83xx/Makefile b/arch/powerpc/platforms/83xx/Makefile
+index ed95bfc..525a26a 100644
+--- a/arch/powerpc/platforms/83xx/Makefile
++++ b/arch/powerpc/platforms/83xx/Makefile
+@@ -6,6 +6,7 @@ obj-$(CONFIG_SUSPEND)		+= suspend.o suspend-asm.o
+ obj-$(CONFIG_MCU_MPC8349EMITX)	+= mcu_mpc8349emitx.o
+ obj-$(CONFIG_MPC830x_RDB)	+= mpc830x_rdb.o
+ obj-$(CONFIG_MPC831x_RDB)	+= mpc831x_rdb.o
++obj-$(CONFIG_BUBBATWO)		+= bubbatwo.o
+ obj-$(CONFIG_MPC832x_RDB)	+= mpc832x_rdb.o
+ obj-$(CONFIG_MPC834x_MDS)	+= mpc834x_mds.o
+ obj-$(CONFIG_MPC834x_ITX)	+= mpc834x_itx.o
+diff --git a/arch/powerpc/platforms/83xx/bubbatwo.c b/arch/powerpc/platforms/83xx/bubbatwo.c
+new file mode 100644
+index 0000000..2179adb
+--- /dev/null
++++ b/arch/powerpc/platforms/83xx/bubbatwo.c
+@@ -0,0 +1,496 @@
++/*
++ * Excito BUBBA|TWO driver.
++ *
++ * Copyright (C) 2008 Excito Elektronik i Skåne AB
++ * Author: "Tor Krill" <tor@excito.com>
++ *
++ * This program is free software; you can redistribute  it and/or modify it
++ * under  the terms of  the GNU General  Public License as published by the
++ * Free Software Foundation;  either version 2 of the  License, or (at your
++ * option) any later version.
++ *
++ * This driver provides an interface to the Powerbutton, LED and reboot
++ * functionality on BUBBA|TWO
++ */
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/of.h>
++//#include <linux/ioport.h>
++#include <asm/io.h>
++
++#include <linux/kernel.h>
++#include <linux/interrupt.h>
++
++#include <linux/delay.h>
++#include <linux/workqueue.h>
++#include <linux/timer.h>
++#include <linux/vmalloc.h>
++
++#include <sysdev/fsl_soc.h>
++#include "mpc83xx.h"
++
++/* Mark this file for ident */
++static char* ver="0.2";
++static char* build=__DATE__ " " __TIME__;
++
++#define DEVNAME "bubbatwo"
++#define BUBBA_MAGIC 0xdeadbeef
++#define LED_DEFAULT_FREQ 0x8000
++#define DEVICE_MAJOR 241
++#define GPIO_IRQ 74
++#define BUTTON  (1<<1)
++
++/* Meta information for this module */
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Tor Krill <tor@excito.com>");
++MODULE_DESCRIPTION("BUBBA|TWO driver");
++
++/* Forwards */
++static int b2_probe(struct platform_device  *dev);
++static int b2_remove(struct platform_device *dev);
++static s32 b2_write_magic (u32 val);
++static s32 b2_read_magic(u32 *val);
++static s32 b2_led_blink(u16 freq);
++static s32 b2_led_on(void);
++
++/* device state
++ *
++ * Mode: 0 - off
++ *       1 - blink
++ *       2 - lit
++ *
++ * Freq: blink frequency
++ *
++ * Invoked: 0 - not invoked
++ *          1 - invoked
++ *
++ * Timer_added 0 - timer not added
++ *             1 - timer added
++ *
++ * Btn_state   0 - button not pressed
++ *             1 - buttom pressed
++ */
++struct b2_stateinfo{
++	u32 mode;
++	u32 freq;
++	u32 invoked;
++	u32 timer_added;
++	u32 btn_state;
++	struct delayed_work mytask;
++	struct timer_list button_timeout;
++	void* gpio;
++	void* rtc;
++	void* gtm;
++};
++
++static struct b2_stateinfo b2_data;
++
++static void button_do_tasklet(struct work_struct *work)
++{
++	char *argv[2], **envp;
++	int ret,i=0;
++
++	if(!b2_data.invoked){
++		b2_data.invoked=1;
++		b2_write_magic(BUBBA_MAGIC);
++		argv[0] = "/sbin/reboot";
++		argv[1] = NULL;
++
++		if (!(envp = (char **) kcalloc (20, sizeof (char *), GFP_KERNEL))) {
++			printk(KERN_ERR  "BUBBATWO: failed to allocate memory");
++		return;
++	}
++
++		/* minimal command environment */
++		envp [i++] = "HOME=/";
++		envp [i++] = "PATH=/sbin:/bin:/usr/sbin:/usr/bin";
++		printk(KERN_DEBUG "BUBBATWO: Invoking usermodehelper");
++		ret=call_usermodehelper (argv [0], argv, envp, 0);
++		kfree (envp);
++		b2_led_blink(LED_DEFAULT_FREQ);
++
++	}else{
++		printk(KERN_DEBUG "BUBBATWO: Already invoked reboot");
++	}
++}
++
++static void button_timedout(unsigned long unused){
++	/* mask gpio irq */
++	clrbits32 (b2_data.gpio+GPIO_GPIMR,BUTTON);
++	printk(KERN_DEBUG "BUBBATWO: Timeout!");
++	schedule_delayed_work(&b2_data.mytask,0);
++}
++
++static s32 b2_write_magic (u32 val)
++{
++	out_be32 (b2_data.rtc+RTC_RTALR,val);
++
++	return 0;
++}
++
++static s32 b2_read_magic(u32 *val)
++{
++	*val=in_be32(b2_data.rtc+RTC_RTALR);
++
++	return 0;
++}
++
++static s32 b2_led_blink(u16 freq)
++{
++
++	/* Reset timer 1 and 2 */
++	out_8 (b2_data.gtm+GTM_GTCFR1, 0x00);
++	/* Enable timer 1, stopped and choose normal operation */
++	out_8 (b2_data.gtm+GTM_GTCFR1, 0x03);
++
++	/* Timer prescaler set to 0x0f
++	 * resulting in a prescale of 0x10
++	 */
++	out_be16 (b2_data.gtm+GTM_GTPSR1, 0x0f);
++
++	/* Set prescale value and set restart
++	 * when timer meets reference value
++	 * Use internal system clock
++	 */
++	setbits16 (b2_data.gtm+GTM_GTMDR1, 0x800a);
++
++	/* Set reference value */
++	out_be16 (b2_data.gtm+GTM_GTRFR1, freq);
++
++	/* Start timer1 */
++	out_8 (b2_data.gtm+GTM_GTCFR1, 0x01);
++
++	return 0;
++}
++
++static s32 b2_led_on(void)
++{
++	out_8 (b2_data.gtm+GTM_GTCFR1, 0x02);
++
++	return 0;
++}
++
++static s32 b2_led_off(void){
++#if 0 /* Not working atm */
++	void __iomem *im;
++	u16 cmp;
++
++	/* reset clock to known state */
++	if(b2_led_blink(0x100)){
++		return -ENODEV;
++	}
++
++	im = ioremap(get_immrbase(), 0x1000);
++
++	if (!im){
++		return -ENOMEM;
++	}
++
++	/* Stop timer */
++	out_8 (im+FSL_GTM0_GTCFR1, 0x03);
++
++	cmp = in_be16 (im+FSL_GTM0_GTCNR1);
++	cmp = cmp == 0 ? 10 : cmp;
++
++	/* Start timer */
++	out_8 (im+FSL_GTM0_GTCFR1, 0x03);
++
++	/* Let timer run */
++	udelay(1000);
++
++	/* Wait for "flip" */
++	while( in_be16 (im+FSL_GTM0_GTCNR1) > cmp ){
++	}
++
++	/* Stop timer */
++	out_8 (im+FSL_GTM0_GTCFR1, 0x03);
++
++	iounmap(im);
++#endif
++	return 0;
++}
++
++static struct platform_device *b2_device;
++
++static struct platform_driver b2_driver = {
++		.driver = {
++				.name = DEVNAME,
++				.owner = THIS_MODULE,
++		},
++		.probe = b2_probe,
++		.remove = b2_remove,
++};
++
++static ssize_t	b2_show_magic(struct device *dev, struct device_attribute *attr, char *buffer)
++{
++	ssize_t len = 0;
++	u32 val;
++	if(b2_read_magic(&val)){
++		return -EINVAL;
++	}
++	len = sprintf (buffer+len, "%u", val);
++
++	return len;
++}
++
++static ssize_t b2_store_magic(struct device *dev, struct device_attribute *attr,const char *buffer, size_t size)
++{
++
++	u32 value=simple_strtoul(buffer,NULL,0);
++
++	if(b2_write_magic(value)){
++		return -EINVAL;
++	}
++
++	return size;
++}
++
++static DEVICE_ATTR(magic, S_IRUGO|S_IWUSR, b2_show_magic, b2_store_magic);
++
++static ssize_t	b2_show_ledmode(struct device *dev, struct device_attribute *attr, char *buffer)
++{
++	ssize_t len = 0;
++	switch(b2_data.mode){
++	case 0:
++		len = sprintf (buffer+len, "off");
++		break;
++	case 1:
++		len = sprintf (buffer+len, "blink");
++		break;
++	case 2:
++		len = sprintf (buffer+len, "lit");
++		break;
++	default:
++		len = sprintf (buffer+len, "unknown");
++	}
++
++	return len;
++}
++
++static ssize_t b2_store_ledmode(struct device *dev, struct device_attribute *attr,const char *buffer, size_t size)
++{
++
++	if(size<1){
++		return -EINVAL;
++	}
++	/* Do a nasty shortcut here only look at first char */
++	switch(buffer[0]){
++	case 'o':
++		b2_data.mode=0;
++		b2_led_off ();
++		break;
++	case 'b':
++		b2_data.mode=1;
++		b2_led_blink (b2_data.freq);
++		break;
++	case 'l':
++		b2_data.mode=2;
++		b2_led_on ();
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return size;
++}
++
++static DEVICE_ATTR(ledmode, S_IRUGO|S_IWUSR, b2_show_ledmode, b2_store_ledmode);
++
++
++static ssize_t	b2_show_ledfreq(struct device *dev, struct device_attribute *attr, char *buffer)
++{
++	ssize_t len = 0;
++
++	len = sprintf (buffer+len, "%u", b2_data.freq);
++
++	return len;
++}
++
++static ssize_t b2_store_ledfreq(struct device *dev, struct device_attribute *attr,const char *buffer, size_t size)
++{
++
++	b2_data.freq=simple_strtoul(buffer,NULL,0);
++
++	return size;
++}
++
++static DEVICE_ATTR(ledfreq, S_IRUGO|S_IWUSR, b2_show_ledfreq, b2_store_ledfreq);
++
++static irqreturn_t bubba_interrupt(int irq, void *data)
++{
++	u32 val;
++
++	if((val=in_be32 (b2_data.gpio+GPIO_GPIER)) & BUTTON){
++
++		/* Clear interrupt */
++		setbits32(b2_data.gpio+GPIO_GPIER,BUTTON);
++		if(!b2_data.invoked){
++
++			if(b2_data.btn_state){
++				/* Button _was_ pressed and now released */
++				b2_data.btn_state=0;
++				del_timer(&b2_data.button_timeout);
++				b2_data.timer_added=0;
++			}else{
++				if(!b2_data.timer_added){
++					b2_data.timer_added=1;
++					init_timer(&b2_data.button_timeout);
++					b2_data.button_timeout.function = button_timedout;
++					b2_data.button_timeout.data = 0;
++					b2_data.button_timeout.expires = jiffies + (2*HZ); /* two second */
++
++					add_timer(&b2_data.button_timeout);
++				}
++			}
++		}
++	}else{
++		printk(KERN_ERR "Unknown interrupt %d\n",val);
++	}
++	return IRQ_HANDLED;
++}
++
++static int request_ioresources(void)
++{
++	b2_data.rtc = ioremap(get_immrbase()+RTC_OFFS,RTC_SIZE);
++	if (!b2_data.rtc){
++		return -EINVAL;
++	}
++
++	b2_data.gtm = ioremap(get_immrbase()+GTM0_OFFS,GTM0_SIZE);
++	if (!b2_data.gtm){
++		iounmap(b2_data.rtc);
++		return -EINVAL;
++	}
++
++	b2_data.gpio = ioremap(get_immrbase()+GPIO_OFFS,GPIO_SIZE);
++	if (!b2_data.gpio){
++		iounmap(b2_data.rtc);
++		iounmap(b2_data.gtm);
++		return -EINVAL;
++	}
++	return 0;
++
++}
++
++
++static int b2_probe(struct platform_device *dev)
++{
++	int ret=0;
++	int irq;
++	struct device_node *np = NULL;
++
++	if(request_ioresources()){
++		return -EINVAL;
++	}
++
++	ret = device_create_file(&b2_device->dev, &dev_attr_magic);
++	if(ret){
++		return -EINVAL;
++	}
++
++	ret = device_create_file(&b2_device->dev, &dev_attr_ledmode);
++	if(ret){
++		device_remove_file(&b2_device->dev, &dev_attr_magic);
++		return -EINVAL;
++	}
++
++	ret = device_create_file(&b2_device->dev, &dev_attr_ledfreq);
++	if(ret){
++		device_remove_file(&b2_device->dev, &dev_attr_magic);
++		device_remove_file(&b2_device->dev, &dev_attr_ledmode);
++		return -EINVAL;
++	}
++
++	b2_data.mode=0;
++	b2_data.freq=0x8000;
++	b2_data.invoked=0;
++	b2_data.timer_added=0;
++	b2_data.btn_state=0;
++
++	np = of_find_node_by_type(np, "gpio");
++	if (!np) {
++		printk(KERN_ERR "Could not find open-pic node\n");
++		device_remove_file (&b2_device->dev, &dev_attr_magic);
++		device_remove_file (&b2_device->dev, &dev_attr_ledmode);
++		device_remove_file (&b2_device->dev, &dev_attr_ledfreq);
++		return -EINVAL;
++	}
++
++	irq=irq_of_parse_and_map(np, 0);
++
++	of_node_put(np);
++
++	/* Configure GPIO irq */
++	if((ret=request_irq(irq,bubba_interrupt,0,DEVNAME,NULL))) {
++		//printk(KERN_ERR "BUBBATWO: IRQ %d request failed - status %d\n",GPIO_IRQ,ret);
++		device_remove_file(&b2_device->dev, &dev_attr_magic);
++		device_remove_file(&b2_device->dev, &dev_attr_ledmode);
++		device_remove_file (&b2_device->dev, &dev_attr_ledfreq);
++		return -EINVAL;
++	}
++
++	/* Set up tasklet for termination */
++	INIT_DELAYED_WORK(&b2_data.mytask,button_do_tasklet);
++
++	/* Any change triggers irq */
++	clrbits32(b2_data.gpio+GPIO_GPICR, BUTTON);
++
++	/* Ack any pending irqs */
++	setbits32(b2_data.gpio+GPIO_GPIER,in_be32(b2_data.gpio+GPIO_GPIER));
++
++	/* Unmask irq */
++	setbits32(b2_data.gpio+GPIO_GPIMR, BUTTON);
++
++	return ret;
++
++}
++
++static int b2_remove(struct platform_device *dev)
++{
++	/* mask gpio irq */
++	clrbits32 (b2_data.gpio+GPIO_GPIMR,BUTTON);
++
++	free_irq (GPIO_IRQ,NULL);
++
++	device_remove_file (&b2_device->dev, &dev_attr_magic);
++	device_remove_file (&b2_device->dev, &dev_attr_ledmode);
++	device_remove_file (&b2_device->dev, &dev_attr_ledfreq);
++
++	iounmap(b2_data.gtm);
++	iounmap(b2_data.rtc);
++	iounmap(b2_data.gpio);
++
++
++	return 0;
++}
++
++static int __init bubbatwo_init(void){
++        int result;
++
++        result = platform_driver_register(&b2_driver);
++        if (result < 0) {
++                printk(KERN_ERR "bubbatwo: Failed to register driver\n");
++                return result;
++        }
++
++		b2_device = platform_device_alloc(DEVNAME,-1);
++		platform_device_add(b2_device);
++
++		printk(KERN_INFO "BUBBATWO: driver ver %s (build %s) loaded\n",ver,build);
++
++        return result;
++
++}
++
++static void __exit bubbatwo_cleanup(void){
++
++        platform_device_del(b2_device);
++        platform_driver_unregister(&b2_driver);
++
++        printk(KERN_INFO "bubbatwo driver removed\n");
++
++}
++/* register init and cleanup functions */
++module_init(bubbatwo_init);
++module_exit(bubbatwo_cleanup);
+diff --git a/arch/powerpc/platforms/83xx/mpc83xx.h b/arch/powerpc/platforms/83xx/mpc83xx.h
+index 82a4345..570cd42 100644
+--- a/arch/powerpc/platforms/83xx/mpc83xx.h
++++ b/arch/powerpc/platforms/83xx/mpc83xx.h
+@@ -48,6 +48,7 @@
+ /* USB Control Register */
+ #define FSL_USB2_CONTROL_OFFS      0x500
+ #define CONTROL_UTMI_PHY_EN        0x00000200
++#define CONTROL_REFSEL_16MHZ	   0x00000040
+ #define CONTROL_REFSEL_24MHZ       0x00000040
+ #define CONTROL_REFSEL_48MHZ       0x00000080
+ #define CONTROL_PHY_CLK_SEL_ULPI   0x00000400
+@@ -59,6 +60,60 @@
+ #define PORTSCX_PTW_16BIT          0x10000000
+ #define PORTSCX_PTS_UTMI           0x00000000
+ #define PORTSCX_PTS_ULPI           0x80000000
++/* RTC Control Registers */
++#define RTC_OFFS               0x300
++#define RTC_SIZE               0xff
++#define RTC_RTCNR              0x00
++#define RTC_RTLDR              0x04
++#define RTC_RTPSR              0x08
++#define RTC_RTCTR              0x0c
++#define RTC_RTEVR              0x10
++#define RTC_RTALR              0x14
++
++/* Global timer registers */
++/* GTM0 */
++#define GTM0_OFFS              0x500
++#define GTM0_SIZE              0xff
++#define GTM1_OFFS              0x600
++#define GTM1_SIZE              0xff
++
++#define GTM_GTCFR1             0x00
++#define GTM_GTCFR2             0x04
++#define GTM_GTMDR1             0x10
++#define GTM_GTMDR2             0x12
++#define GTM_GTRFR1             0x14
++#define GTM_GTRFR2             0x16
++#define GTM_GTCPR1             0x18
++#define GTM_GTCPR2             0x1a
++#define GTM_GTCNR1             0x1c
++#define GTM_GTCNR2             0x1e
++#define GTM_GTMDR3             0x20
++#define GTM_GTMDR4             0x22
++#define GTM_GTRFR3             0x24
++#define GTM_GTRFR4             0x26
++#define GTM_GTCPR3             0x28
++#define GTM_GTCPR4             0x2a
++#define GTM_GTCNR3             0x2c
++#define GTM_GTCNR4             0x2e
++#define GTM_GTEVR1             0x30
++#define GTM_GTEVR2             0x32
++#define GTM_GTEVR3             0x34
++#define GTM_GTEVR4             0x36
++#define GTM_GTPSR1             0x38
++#define GTM_GTPSR2             0x3a
++#define GTM_GTPSR3             0x3c
++#define GTM_GTPSR4             0x3e
++
++/* GPIO Registers */
++#define GPIO_OFFS              0xc00
++#define GPIO_SIZE              0xff
++#define GPIO_GPDIR             0x00
++#define GPIO_GPODR             0x04
++#define GPIO_GPDAT             0x08
++#define GPIO_GPIER             0x0c
++#define GPIO_GPIMR             0x10
++#define GPIO_GPICR             0x14
++
+ 
+ /*
+  * Declaration for the various functions exported by the
+diff --git a/arch/powerpc/platforms/83xx/usb.c b/arch/powerpc/platforms/83xx/usb.c
+index 2c64164..96b27ec 100644
+--- a/arch/powerpc/platforms/83xx/usb.c
++++ b/arch/powerpc/platforms/83xx/usb.c
+@@ -184,7 +184,7 @@ int mpc831x_usb_cfg(void)
+ 		if (of_device_is_compatible(immr_node, "fsl,mpc8315-immr"))
+ 			refsel = CONTROL_REFSEL_24MHZ;
+ 		else
+-			refsel = CONTROL_REFSEL_48MHZ;
++			refsel = CONTROL_REFSEL_16MHZ;
+ 		/* Set UTMI_PHY_EN and REFSEL */
+ 		out_be32(usb_regs + FSL_USB2_CONTROL_OFFS,
+ 				CONTROL_UTMI_PHY_EN | refsel);
+diff --git a/drivers/rtc/rtc-isl1208.c b/drivers/rtc/rtc-isl1208.c
+index da8beb8..2d04956 100644
+--- a/drivers/rtc/rtc-isl1208.c
++++ b/drivers/rtc/rtc-isl1208.c
+@@ -619,7 +619,7 @@ static const struct attribute_group isl1208_rtc_sysfs_files = {
+ static int
+ isl1208_probe(struct i2c_client *client, const struct i2c_device_id *id)
+ {
+-	int rc = 0;
++	int rc = 0,sr;
+ 	struct rtc_device *rtc;
+ 
+ 	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
+@@ -657,16 +657,23 @@ isl1208_probe(struct i2c_client *client, const struct i2c_device_id *id)
+ 
+ 	i2c_set_clientdata(client, rtc);
+ 
+-	rc = isl1208_i2c_get_sr(client);
+-	if (rc < 0) {
++	sr = isl1208_i2c_get_sr(client);
++	if (sr < 0) {
+ 		dev_err(&client->dev, "reading status failed\n");
+ 		goto exit_unregister;
+ 	}
+ 
+-	if (rc & ISL1208_REG_SR_RTCF)
++	if (sr & ISL1208_REG_SR_RTCF)
+ 		dev_warn(&client->dev, "rtc power failure detected, "
+ 			 "please set clock.\n");
+ 
++	/* bugfix for bubbatwo - make sure rtc is running */
++	dev_info (&client->dev,  "Applying bubbatwo rtc fix\n");
++	rc = i2c_smbus_write_byte_data (client, ISL1208_REG_SR,sr | ISL1208_REG_SR_WRTC);
++	rc = i2c_smbus_read_byte_data (client, ISL1208_REG_SC);
++	rc = i2c_smbus_write_byte_data (client, ISL1208_REG_SC,rc);
++	rc = i2c_smbus_write_byte_data (client, ISL1208_REG_SR,sr & ~ISL1208_REG_SR_WRTC);
++
+ 	rc = sysfs_create_group(&client->dev.kobj, &isl1208_rtc_sysfs_files);
+ 	if (rc)
+ 		goto exit_unregister;
+-- 
